@@ -60,7 +60,7 @@ def plot_reduced_llm_loss(csv1_path, csv2_path, num_rows=100):
         
         # 显示图表
         plt.tight_layout()
-        plt.savefig("/mnt/shared-storage-user/suzhongling/xtuner_11_27/my_data/loss.png")
+        plt.savefig("/mnt/shared-storage-user/suzhongling/xtuner_11_27/my_data/ep8/loss_1_node.png")
         
         # 打印一些统计信息
         print(f"nccl - 数据点数: {len(df1_selected)}, Reduced LLM Loss范围: [{df1_selected['reduced_llm_loss'].min():.4f}, {df1_selected['reduced_llm_loss'].max():.4f}]")
@@ -76,9 +76,9 @@ def plot_reduced_llm_loss(csv1_path, csv2_path, num_rows=100):
         print(f"发生错误: {e}")
 
 if __name__ == "__main__":
-    nccl = "/mnt/shared-storage-user/suzhongling/xtuner_11_27/my_data/qwen30_nccl_cwh.csv"
-    our = "/mnt/shared-storage-user/suzhongling/xtuner_11_27/my_data/qwen30_our_agrs.csv"
+    nccl = "/mnt/shared-storage-user/suzhongling/xtuner_11_27/my_data/ep8/qwen30_nccl_ep8_1_node.csv"
+    our = "/mnt/shared-storage-user/suzhongling/xtuner_11_27/my_data/ep8/qwen30_our_ep8_1_node.csv"
     
     # 调用绘图函数，指定要绘制的行数
     # 例如：要绘制200行数据，只需将下面的100改为200
-    plot_reduced_llm_loss(nccl, our, num_rows=264)
+    plot_reduced_llm_loss(nccl, our, num_rows=500)

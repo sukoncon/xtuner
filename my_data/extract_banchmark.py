@@ -30,7 +30,7 @@ def extract_metrics_simple(log_path, output_path):
 
 # 使用方法
 if __name__ == "__main__":
-    log_file = "/mnt/shared-storage-user/suzhongling/xtuner_11_27/work_dirs/qwen30_our_ep8_1_node/20251202141226/logs/rank0.log"
-    output_file = "/mnt/shared-storage-user/suzhongling/xtuner_11_27/my_data/ep8/qwen30_our_ep8_1_node.csv"
+    log_file = "/mnt/shared-storage-user/suzhongling/xtuner_11_27/work_dirs/qwen30_ep8_nccl_1_node/20251202141141/logs/rank0.log"
+    output_file = "/mnt/shared-storage-user/suzhongling/xtuner_11_27/my_data/ep8/qwen30_nccl_ep8_1_node.csv"
     extract_metrics_simple(log_file, output_file)
     print(f"提取完成！结果保存在: {output_file}")

@@ -14,8 +14,8 @@ from torch.distributed._functional_collectives import (
 )
 from typing_extensions import override
 
-# from xtuner.v1.ops import _permute, _unpermute, _unpermute_inplace, _unpermute_bwd
-from xtuner.v1.ops import unpermute, permute
+from xtuner.v1.ops import _permute, _unpermute, _unpermute_inplace, _unpermute_bwd
+# from xtuner.v1.ops import unpermute, permute
 from xtuner.v1.utils import copy_method_signature, get_device, get_logger
 
 from . import XTUNER_DISPATCHER_DEBUG
@@ -444,6 +444,154 @@ ag_symm = None
 rs_symm = None
 ag_manager = None
 rs_manager = None
+rs_event = None
+
+class PermuteMoE_topK_inplace(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        input_act: Tensor,
+        indices: Tensor,
+        num_out_tokens: int = 0,
+        num_negative_one_in_indices: int = 0,
+    ):
+        if not input_act.numel():
+            return input_act, None
+
+        if indices.dtype is torch.int32:
+            indices = indices.to(torch.int32)
+
+        if indices.dim() == 1:
+            indices = indices.view(-1, 1)
+        if not input_act.is_contiguous():
+            input_act = input_act.contiguous()
+        if not indices.is_contiguous():
+            indices = indices.contiguous()
+
+        num_topK = indices.size(1)
+
+        permuted_act, row_id_map = _permute(
+            input_act,
+            indices,
+            num_topK,
+            num_out_tokens,
+            num_negative_one_in_indices,
+        )
+
+        ctx.row_id_map = row_id_map
+        ctx.num_tokens = indices.size(0)
+        ctx.num_topK = num_topK
+        return permuted_act, row_id_map
+
+    @staticmethod
+    def backward(  # type: ignore[override]
+        ctx, permuted_act_grad: Tensor, row_id_map_grad: None
+    ) -> tuple[Tensor, None, None, None]:
+        if not permuted_act_grad.numel():
+            return permuted_act_grad, None, None, None
+
+        permuted_act_grad = permuted_act_grad.contiguous()
+
+        row_id_map = ctx.row_id_map
+        num_tokens = ctx.num_tokens
+        num_topK = ctx.num_topK
+        global rs_manager, use_custom_rs, rs_symm, rs_event
+        if use_custom_rs:
+            if rs_symm is None:
+                rs_symm = SymmBufferManager(int(os.getenv("SYMM_BUF_SIZE", 0)), num_buffers=1)
+            # if rs_event is not None:
+            #     torch.cuda.default_stream().wait_event(rs_event)
+            send_bytes = permuted_act_grad.numel() * permuted_act_grad.element_size()
+            device = permuted_act_grad.device
+            dtype = permuted_act_grad.dtype
+            send_numel = permuted_act_grad.numel()
+            symm_input = rs_symm.get_buffer(bytes=send_bytes, device=device)
+
+            unpermuted_act_grad = symm_input.view(dtype)[ : send_numel].view(permuted_act_grad.shape)
+            _unpermute_inplace(permuted_act_grad, unpermuted_act_grad, row_id_map, torch.tensor([]), num_tokens, num_topK)
+        else:
+            unpermuted_act_grad = _unpermute(permuted_act_grad, row_id_map, torch.tensor([]), num_tokens, num_topK)
+        return unpermuted_act_grad, None, None, None
+
+def permute(
+    input_act, indices, num_topK: int | None = None, num_out_tokens=0, num_negative_one_in_indices=0
+) -> tuple[Tensor, Tensor]:
+    return PermuteMoE_topK_inplace.apply(input_act, indices, num_out_tokens, num_negative_one_in_indices)  # type: ignore[return-value]
+
+class UnpermuteMoE_topK_inplace(Function):
+    @staticmethod
+    def forward(ctx, input_act: Tensor, row_id_map: Tensor, probs: Tensor | None = None):
+        if not input_act.numel():
+            ctx.probs = probs
+            return input_act
+
+        if not input_act.is_contiguous():
+            input_act = input_act.contiguous()
+        if not row_id_map.is_contiguous():
+            row_id_map = row_id_map.contiguous()
+        if probs is not None and not probs.is_contiguous():
+            probs = probs.contiguous()
+
+        if probs is not None and probs.dtype != torch.float32:
+            probs = probs.to(torch.float32)
+
+        num_tokens = probs.size(0) if probs is not None else input_act.size(0)
+        num_topK = probs.size(1) if probs is not None else 1
+        
+        global rs_manager, use_custom_rs, rs_symm, rs_event
+        if use_custom_rs:
+            if rs_symm is None:
+                rs_symm = SymmBufferManager(int(os.getenv("SYMM_BUF_SIZE", 0)), num_buffers=1)
+            # if rs_event is not None:
+            #     torch.cuda.default_stream().wait_event(rs_event)
+
+            send_bytes = input_act.numel() * input_act.element_size()
+            device = input_act.device
+            dtype = input_act.dtype
+            send_numel = input_act.numel()
+            symm_input = rs_symm.get_buffer(bytes=send_bytes, device=device)
+
+            symm_input = symm_input.view(dtype)[ : send_numel].view(input_act.shape)
+            unpermuted_output = symm_input
+            _unpermute_inplace(input_act, 
+                                unpermuted_output, 
+                                row_id_map,
+                                probs,
+                                num_tokens,
+                                num_topK,
+                            )
+
+        else:
+            unpermuted_output = _unpermute(
+                input_act,
+                row_id_map,
+                probs if probs is not None else torch.tensor([]),
+                num_tokens,
+                num_topK,
+            )
+        ctx.save_for_backward(input_act, row_id_map, probs)
+        return unpermuted_output
+
+    @staticmethod
+    def backward(ctx, unpermuted_act_grad: Tensor) -> tuple[Tensor | None, None, Tensor | None]:  # type: ignore[override]
+        if not unpermuted_act_grad.numel():
+            return unpermuted_act_grad, None, ctx.probs
+
+        input_act, row_id_map, probs = ctx.saved_tensors
+
+        act_grad = None
+        prob_grad = None
+        if ctx.needs_input_grad[0]:
+            act_grad, prob_grad = _unpermute_bwd(unpermuted_act_grad, input_act, row_id_map, probs)
+
+        if not ctx.needs_input_grad[2]:
+            prob_grad = None
+
+        return act_grad, None, prob_grad
+
+
+def unpermute(input_act, row_id_map, probs=None) -> Tensor:
+    return UnpermuteMoE_topK_inplace.apply(input_act, row_id_map, probs)  # type: ignore[return-value]
 
 
 def copy_tensor_in_chunks(src_tensor, dst_tensor, chunk_size_gb=0.1):
@@ -625,11 +773,9 @@ class _AsyncDispatch(Function):
         world_size = dist.get_world_size(group=ctx.process_group)
         if world_size == 1:
             return grad_output, None, None, None, None, None, None, None, None
-
         with torch.cuda.stream(ctx.comm_stream):
             if ctx.backward_previous_event is not None:
                 ctx.comm_stream.wait_event(ctx.backward_previous_event)
-
             global rs_manager, use_custom_rs, rs_symm
 
             if use_custom_rs:
@@ -657,7 +803,7 @@ class _AsyncDispatch(Function):
                 dtype = grad_output.dtype
                 symm_input = rs_symm.get_buffer(bytes=send_bytes, device=device)
                 symm_input = symm_input.view(dtype)[ : send_numel]
-                symm_input.copy_(grad_output.flatten())
+                # symm_input.copy_(grad_output.flatten())
                 symm_input = symm_input.view(grad_output.shape)
                 # ib_wrapper.barrier_node_on_stream(comm_stream)
                 # torch.mul(grad_output.flatten(), 10**14, out = symm_input)
@@ -671,6 +817,9 @@ class _AsyncDispatch(Function):
                 )
                 # combined_grad_output /= 10**14
                 combined_grad_output = combined_grad_output.view(-1, *grad_output.shape[1:])
+
+                # global rs_event
+                # rs_event = comm_stream.record_event()
 
                 # combined_grad_output_ = reduce_scatter_tensor(
                 #     grad_output, reduceOp="sum", scatter_dim=0, group=ctx.process_group
@@ -710,6 +859,11 @@ class _AsyncCombine(Function):
         comm_stream: torch.cuda.Stream,
         process_group: dist.ProcessGroup,
     ):
+        
+        # with torch.cuda.stream(torch.cuda.default_stream()):
+        #     dist.barrier(group=process_group)
+            # ib_wrapper.barrier_node_on_stream(torch.cuda.default_stream())
+
         with torch.cuda.stream(comm_stream):
             comm_stream.wait_event(forward_previous_event)
 
@@ -736,7 +890,7 @@ class _AsyncCombine(Function):
                 dtype = hidden_states.dtype
                 symm_input = rs_symm.get_buffer(bytes=send_bytes, device=device)
                 symm_input = symm_input.view(dtype)[ : send_numel]
-                symm_input.copy_(hidden_states.flatten())
+                # symm_input.copy_(hidden_states.flatten())
                 symm_input = symm_input.view(hidden_states.shape)
                 # ib_wrapper.barrier_node_on_stream(comm_stream)
                 # torch.mul(hidden_states.flatten(), 10**6, out = symm_input)
@@ -750,9 +904,12 @@ class _AsyncCombine(Function):
                 )   
                 # combined_hidden_states /= 10**6
                 combined_hidden_states = combined_hidden_states.view(-1, *hidden_states.shape[1:])
+                global rs_event
+                rs_event = comm_stream.record_event()
                 
             else:
                 # print(f"{hidden_states.mean() = }")
+                # symm_input = 
                 combined_hidden_states = reduce_scatter_tensor_autograd(
                     hidden_states, reduceOp="sum", scatter_dim=0, group=process_group
                 )
