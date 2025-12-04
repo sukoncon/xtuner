@@ -515,7 +515,6 @@ def foreach_all_gather(
     world_size, rank = group.size(), group.rank()
     device_handle = _get_device_handle(device.type)
     
-
     with device_handle.stream(all_gather_copy_in_stream):
         param_all_gather_inputs = _get_param_all_gather_inputs(fsdp_params)
         (
@@ -556,7 +555,6 @@ def foreach_all_gather(
             device_count=torch.cuda.device_count(),
             all_gather_stream=all_gather_stream
         )
-
     # all_gather_output_ = torch.empty_like(all_gather_output)
     # Ensure all_gather_stream waits for copy operations to complete
     all_gather_stream.wait_stream(all_gather_copy_in_stream)
@@ -673,6 +671,12 @@ def foreach_all_gather_copy_out(
         all_gather_work.wait()
     world_size, device = group.size(), all_gather_output.device
 
+    is_bar = int(os.getenv("BARRIER_FSDP_ON_COMP", 0))
+    if is_bar:
+        barrier_tensor = torch.randn(1, device = device)
+        with torch.cuda.stream(device_handle.current_stream()):
+            dist.all_reduce(barrier_tensor, group = group, op=dist.ReduceOp.AVG)
+   
     split_with_sizes_out: List[torch.Tensor] = []
     shard_i_copy_infos: List[Tuple[FSDPParam, List[torch.Tensor]]] = []
     for all_gather_input_numels, all_gather_input_dtypes, fsdp_param in zip(
